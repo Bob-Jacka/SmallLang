@@ -25,10 +25,20 @@
 #ifdef CLASS
 
 struct ClassInfo {
-    llvm::StructType current_class;
-    llvm::StructType super_class;
+    llvm::StructType *current_class{};
+    llvm::StructType *super_class{};
     std::map<std::string, llvm::Type *> class_parameters;
     std::map<std::string, llvm::Function *> class_methods;
+
+    ClassInfo &operator=(const ClassInfo &rhs) {
+        if (this != &rhs) {
+            current_class = rhs.current_class;
+            super_class = rhs.super_class;
+            class_parameters = rhs.class_parameters;
+            class_methods = rhs.class_methods;
+        }
+        throw;
+    }
 
     ClassInfo() = default;
 
@@ -49,6 +59,7 @@ public:
         module_init();
         get_external_functions();
         setup_global();
+        setup_target_triple();
     }
 
     llvm::Value *exec(const std::string &program) {
@@ -65,13 +76,21 @@ public:
         return builder->CreateCall(print_fn, arguments);
     }
 
+    void setup_target_triple() {
+        auto target = llvm::Triple();
+        //TODO HARDCODE!!
+        target.setArch(llvm::Triple::ArchType::x86_64);
+        target.setOS(llvm::Triple::OSType::Linux);
+        module->setTargetTriple(target);
+    }
+
     void setup_global() {
         std::map<std::string, llvm::Value *> global{
                 {"Version", builder->getInt32(42)}
         };
 
         std::map<std::string, llvm::Value *> global_record{};
-        for (auto entry: global) {
+        for (const auto &entry: global) {
             global_record[entry.first] = create_glob_val(entry.first, static_cast<llvm::Constant *>(entry.second));
         }
 
@@ -182,7 +201,7 @@ private:
 
 #ifdef CLASS
         // Classes:
-        return classMap[type_].current_class.getPointerTo();
+        return classMap[type_].current_class->getPointerTo();
 #endif
     }
 
@@ -197,10 +216,17 @@ private:
     }
 
     void inherit_from_super_class(llvm::StructType *new_class, llvm::StructType *super_class) {
-        //
+        auto base_class_info = &classMap[super_class->getName().data()];
+
+        classMap[super_class->getName().data()] = {
+                new_class,
+                super_class,
+                base_class_info->class_parameters,
+                base_class_info->class_methods,
+        };
     }
 
-    void build_class_info(llvm::StructType *new_class, const Exp &exp, std::shared_ptr<Environment> env) {
+    void build_class_info(llvm::StructType *new_class, const Exp &exp, const std::shared_ptr<Environment> &env) {
         auto class_name = exp.list[1].string;
         auto class_info = &classMap[class_name];
 
@@ -227,24 +253,112 @@ private:
     }
 
     void build_class_body(llvm::StructType *new_class) {
-        auto class_name = new_class->getName().data();
+        auto class_name = std::string(new_class->getName().data());
         auto class_info = &classMap[class_name];
 
-        auto class_fields = std::vector<llvm::Type *>{};
+        auto vtable_name = class_name + "_vTable";
+        auto vtableTy = llvm::StructType::create(*ctx, vtable_name);
+
+        auto class_fields = std::vector<llvm::Type *>{
+                vtableTy->getPointerTo()
+        };
         for (const auto &field: class_info->class_parameters) {
             class_fields.push_back(field.second);
 
         }
         new_class->setBody(class_fields, false);
+
+        build_virt_table(new_class);
+    }
+
+    void build_virt_table(llvm::StructType *new_class) {
+        auto class_name = std::string(new_class->getName());
+        auto vtable_name = class_name + "_vTable";
+
+        auto vtableTy = llvm::StructType::getTypeByName(*ctx, vtable_name);
+        std::vector<llvm::Constant *> vtable_methods;
+        std::vector<llvm::Type *> vtable_methods_tys;
+
+        for (auto &method_info: classMap[class_name].class_methods) {
+            auto method = method_info.second;
+            vtable_methods.push_back(method);
+            vtable_methods_tys.push_back(method->getType());
+        }
+
+        vtableTy->setBody(vtable_methods_tys);
+        auto vtable_value = llvm::ConstantStruct::get(vtableTy, vtable_methods);
+        create_glob_val(vtable_name, vtable_value);
+    }
+
+    size_t get_method_idx(llvm::StructType *class_ent, const std::string &method_name) {
+        auto methods = &classMap[class_ent->getName().data()].class_methods;
+        auto iter = methods->find(method_name);
+        return std::distance(methods->begin(), iter);
     }
 
     bool is_tagged_list(const Exp &exp, const std::string &tag_name) {
-        return exp.type == ExpType::LIST and exp.list[0].type == ExpType::SYMBOL and exp.list[0].string == tag;
+        return exp.type == ExpType::LIST and exp.list[0].type == ExpType::SYMBOL and exp.list[0].string == tag_name;
     }
 
     bool is_var(const Exp &exp) { return is_tagged_list(exp, "var"); }
 
     bool is_def(const Exp &exp) { return is_tagged_list(exp, "var"); }
+
+    bool is_new(const Exp &exp) { return is_tagged_list(exp, "new"); }
+
+    bool is_property(const Exp &exp) { return is_tagged_list(exp, "prop"); }
+
+    bool is_super_class(const Exp &exp) { return is_tagged_list(exp, "super"); }
+
+    llvm::Value *
+    create_class_instance(const Exp &exp, const std::shared_ptr<Environment> &env, const std::string &name) {
+        auto class_name = exp.list[1].string;
+        auto local_cls = get_class_by_name(class_name);
+
+        if (local_cls == nullptr) {
+            throw;
+        }
+#ifdef STACK_ALLOC
+        auto instance = name.empty() ? builder->CreateAlloca(local_cls)
+                                     : builder->CreateAlloca(local_cls, nullptr,
+                                                             name);
+#elifdef HEAP_ALLOC
+        auto instance = malloc_instance(cls, name);
+#endif
+        auto constructor = module->getFunction(class_name + "_constructor");
+        std::vector<llvm::Value *> arguments{instance};
+        for (int i = 2; i < exp.list.size(); ++i) {
+            arguments.push_back(gen(exp.list[i], env));
+        }
+        builder->CreateCall(constructor, arguments);
+        return instance;
+    }
+
+    size_t get_field_index(llvm::StructType *cls_ent, const std::string &name) {
+        auto fields = &classMap[cls_ent->getName().data()].class_parameters;
+        auto iter = fields->find(name);
+        return std::distance(fields->begin(), iter) + RESERVED_FIELDS_COUNT; //+1 for vtable
+    }
+
+#if defined(CLASS) && defined(HEAP_ALLOC)
+    llvm::Value* malloc_instance(llvm::StructType* cls, const std::string& name) {
+        auto type_size = builder->getInt64(get_type_size(cls));
+        auto malloc_ptr = builder->CreateCall(module->getFunction("GC_malloc"), type_size, name);
+
+        auto instance = builder->CreatePointerCast(malloc_ptr, cls->getPointerTo());
+        auto class_name = std::string(cls.getName().data());
+        auto vtable_name = class_name + "_vTable";
+        auto vtable_address = builder->CreateStructGEP(cls, instance, VTABLE_INDEX);
+        auto vtable = module->GetNamedGlobal(vtable_name);
+        builder->CreateStore(vtable, vtable_address);
+
+        return instance;
+    }
+
+    size_t get_type_size(llvm::Type* type) {
+        return module->getDataLayout().getTypeAllocSize(type);
+    }
+#endif
 
 #endif
 
@@ -258,7 +372,7 @@ private:
         if (type == "string") {
             return builder->getInt8Ty()->getPointerTo();
         }
-        return classMap[type].current_class.getPointerTo();
+        return classMap[type].current_class->getPointerTo();
     }
 
     bool has_return_type(const Exp &exp) {
@@ -465,7 +579,34 @@ private:
                         // Function declaration: (def <name> <params> <body>)
                         //
                     else if (opcode == "def") {
-                        return compile_function(exp, exp.list[1].string, env);
+                        return compile_function(exp, const_cast<std::string &>(exp.list[1].string), env);
+                    } else if (opcode == "method") {
+                        auto method_name = exp.list[2].string;
+
+                        llvm::StructType *class_ent;
+                        llvm::Value *vtable;
+                        llvm::StructType *vtable_ty;
+
+                        if (is_super_class(exp.list[1])) {
+                            auto class_name = exp.list[1].list[1].string;
+                            class_ent = (llvm::StructType *) &classMap[class_name].super_class;
+                            auto parent_name = std::string{cls->getName().data()};
+                            vtable = module->getNamedGlobal(parent_name + "_vTable");
+                            vtable_ty = llvm::StructType::getTypeByName(*ctx, parent_name + "_vTable");
+
+                        } else {
+                            auto instance = gen(exp.list[1], env);
+                            class_ent = (llvm::StructType *) (instance->getType()->getContainedType(0));
+
+                            auto vtable_address = builder->CreateStructGEP(class_ent, instance, VTABLE_INDEX);
+
+                            vtable = builder->CreateLoad(class_ent->getElementType(VTABLE_INDEX), vtable_address, "vt");
+                            vtable_ty = (llvm::StructType *) (vtable->getType()->getContainedType(0));
+                        }
+                        auto method_index = get_method_idx(class_ent, method_name);
+                        auto method_ty = (llvm::StructType *) vtable_ty->getElementType(method_index);
+                        auto method_address = builder->CreateStructGEP(vtable_ty, vtable, method_index);
+                        return builder->CreateLoad(method_ty, method_address);
                     }
 #endif
                     if (opcode == "var") {
@@ -475,10 +616,27 @@ private:
                         }
 #endif
                         auto variable_name = exp.list[1].string;
+                        if (is_new(exp.list[2])) {
+                            auto instance = create_class_instance(exp.list[2], env, variable_name);
+                            return env->define_var(variable_name, instance);
+                        }
+
                         auto init = gen(exp.list[2], env);
 
                         auto type = extract_variable_type(variable_name);
                         auto binding = allocate_variable(variable_name, type, env);
+                        return builder->CreateStore(init, binding);
+                    } else if (opcode == "prop") {
+                        auto instance = gen(exp.list[1], env);
+                        auto field_name = exp.list[2].string;
+
+                        auto ptr_field = std::string("p") + field_name;
+                        auto class_entity = (llvm::StructType *) instance->getType()->getContainedType(0);
+                        auto field_index = get_field_index(class_entity, field_name);
+                        auto address = builder->CreateStructGEP(class_entity, instance, field_index, ptr_field);
+                        return builder->CreateLoad(class_entity->getElementType(field_index), address, field_name);
+                    } else if (opcode == "new") {
+                        create_class_instance(exp, env, "");
                     } else if (opcode == "printf") { //react on printf function opcode
                         auto printf_fun = module->getFunction("printf");
                         std::vector<llvm::Value *> args{};
@@ -488,11 +646,26 @@ private:
                         return builder->CreateCall(printf_fun, args);
                     } else if (opcode == "set") {
                         auto value = gen(exp.list[2], env);
-                        auto variable_name = exp.list[1].string;
-                        auto variable_binding = env->get_val(variable_name);
 
-                        builder->CreateStore(value, variable_binding);
-                        return value;
+                        if (is_property(exp.list[1])) {
+                            auto instance = gen(exp.list[1].list[1], env);
+                            auto field_name = exp.list[1].list[2].string;
+
+                            auto ptr_field = std::string("p") + field_name;
+                            auto class_entity = (llvm::StructType *) instance->getType()->getContainedType(0);
+                            auto field_index = get_field_index(class_entity, field_name);
+                            auto address = builder->CreateStructGEP(class_entity, instance, field_index, ptr_field);
+                            builder->CreateStore(value, address);
+                            return value;
+
+                        } else {
+                            auto variable_name = exp.list[1].string;
+                            auto variable_binding = env->get_val(variable_name);
+
+                            builder->CreateStore(value, variable_binding);
+                            return value;
+                        }
+
                     } else if (opcode == "begin") {
                         auto inner_block = std::make_shared<Environment>(
                                 std::map<std::string, llvm::Value *>{}, env
@@ -529,15 +702,39 @@ private:
 #ifdef FUNC
                     else {
                         auto callable_obj = gen(exp.list[0], env);
+                        auto func = (llvm::Function *) (callable_obj);
                         std::vector<llvm::Value *> arguments{};
-                        for (int i = 1; i < exp.list.size(); ++i) {
-                            arguments.push_back(gen(exp.list[i], env));
+                        unsigned int arg_idx = 0;
+                        for (int i = 1; i < exp.list.size(); ++arg_idx) {
+                            auto arg_val = gen(exp.list[i], env);
+                            auto func_ty = func->getArg(arg_idx)->getType();
+                            auto casted_val = builder->CreateBitCast(arg_val, func_ty);
+
+                            arguments.push_back(casted_val);
                         }
 
-                        auto local_fun_call = static_cast<llvm::Function *>(callable_obj);
-                        return builder->CreateCall(local_fun_call, arguments);
+                        return builder->CreateCall(func, arguments);
                     }
 #endif
+                } else {
+                    auto loaded_method = (llvm::LoadInst *) gen(exp.list[0], env);
+                    auto func_ty = (llvm::FunctionType *) (loaded_method
+                            ->getPointerOperand()
+                            ->getType()->getContainedType(0)
+                            ->getContainedType(0));
+
+                    std::vector<llvm::Value *> arguments{};
+                    for (int i = 1; i < exp.list.size(); ++i) {
+                        auto arg_val = gen(exp.list[1], env);
+                        auto param_ty = func_ty->getParamType(i - 1);
+                        if (arg_val->getType() != param_ty) {
+                            auto casted_val = builder->CreateBitCast(arg_val, param_ty);
+                            arguments.push_back(casted_val);
+                        } else {
+                            arguments.push_back(arg_val);
+                        }
+                    }
+                    return builder->CreateCall(func_ty, loaded_method, arguments);
                 }
             }
             default:
@@ -554,6 +751,10 @@ private:
                         byteptr,
                         true
                 )
+        );
+
+        module->getOrInsertFunction("GC_malloc", llvm::FunctionType::get(
+                byteptr, builder->getInt64Ty(), false)
         );
     }
 };
